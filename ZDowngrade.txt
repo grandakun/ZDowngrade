@@ -1,0 +1,530 @@
+//------------------------------------------------------------------
+// ZDowngrade.txt
+// Project:   Zbrush_Downgrade
+// Plugin:    ZDowngrade
+// Version:   1.0.0
+// Date:      2026-08-03
+//
+// ZDowngrade: batch export every SubTool of the current Tool to GoZ
+// (.goz) files plus a readable zmeta.txt manifest, and batch import a
+// folder of .goz files back into SubTools, restoring SubTool order,
+// folders and subdivision levels.
+//
+// Export: all SubTools -> .goz (at max SDiv) + zmeta.txt (schema=2,
+// fields=o,n,f,fi,fn,fp,sc,sm,st). zmeta.txt records the original
+// SubTool order, folder membership and sdivMax for import. The manifest
+// is written by ZDMetaIO64.dll (SaveMetaFile), not by MemSaveToFile,
+// so the file name stays lowercase "zmeta.txt" on disk.
+//
+// Import: first file Tool:Import (replaces the current Tool - save
+// first!), following files AppendNewSubTool + Tool:Import. When
+// zmeta.txt is present, SubTools are imported in zmeta order, folders
+// are restored (RenameSetNext + New Folder + MoveUp), and subdivision
+// levels are rebuilt with Tool:Geometry:Reconstruct Subdiv up to the
+// recorded sdivMax (SubTools without an sm record are skipped).
+//
+// ZBrush 2023 gotchas (kept for maintenance):
+// - FileExecute return values are unreliable (always 0). Read results
+//   from the memblock, never trust the return value.
+// - MemReadString output variables must be initialized (VarSet "") first.
+// - Local variables (first VarSet inside a RoutineDef) must NOT contain
+//   underscores; global VarDef vars may.
+// - [Pause] does not exist; [Delay] is the correct pause command.
+// - Note does not render "\n".
+// - Folder names should stay ASCII (official ZBrush advice).
+// - zmeta.txt is written by ZDMetaIO64.dll SaveMetaFile, NOT by
+//   MemSaveToFile: ZBrush forces ".txt" -> ".TXT" on write, which
+//   breaks consumers on case-sensitive filesystems.
+//------------------------------------------------------------------
+
+[VarDef, ZDG_dllRel,     "ZDowngradeData/ZFileUtils64.dll"]
+[VarDef, ZDG_metaDllRel, "ZDowngradeData/ZDMetaIO64.dll"]
+[VarDef, ZDG_scriptFull, ""]
+[VarDef, ZDG_scriptDir,  ""]
+[VarDef, ZDG_zscFull,    ""]
+[VarDef, ZDG_dllFull,    ""]
+[VarDef, ZDG_metaDllFull,""]
+[VarDef, ZDG_lastRoot,   ""]
+[VarDef, ZDG_savePath,   ""]
+[VarDef, ZDG_version,    "1.0.0"]
+[VarDef, ZDG_foldersRestored, 0]
+[VarDef, ZDG_subdivRestored,  0]
+[VarDef, ZDG_padOut,     ""]
+[VarDef, ZDGtxtPath,     ""]
+[VarDef, ZDGtxtOffset,   0]
+[VarDef, ZDGtxtBytes,    0]
+[VarDef, ZDGsaveBytes,   0]
+[VarDef, ZDGcrlf,        ""]
+[VarDef, ZDG_folderName, ""]
+[VarDef, ZDG_folderIndex, -1]
+[VarDef, ZDG_folderPos,  0]
+[VarDef, ZDG_importPath, ""]
+[VarDef, ZDG_metaPath, ""]
+
+[VarSet, ZDG_scriptFull, [FileNameResolvePath, "ZDowngrade.txt"]]
+[VarSet, ZDG_scriptDir,  [FileNameExtract, ZDG_scriptFull, 1]]
+[VarSet, ZDG_zscFull,    [StrMerge, ZDG_scriptDir, "ZDowngrade.zsc"]]
+[VarSet, ZDG_dllFull,   [StrMerge, ZDG_scriptDir, ZDG_dllRel]]
+[VarSet, ZDG_metaDllFull,[StrMerge, ZDG_scriptDir, ZDG_metaDllRel]]
+[VarSet, ZDGcrlf, [StrMerge, [StrFromAsc, 13], [StrFromAsc, 10]]]
+
+//==================================================================
+// Utility: ask for a .goz save file. The selected file's folder is
+// used as the batch root; with one SubTool the exact file is used.
+//==================================================================
+[RoutineDef, ZDG_PickSaveFile,
+  [VarSet, ZDG_savePath, ""]
+  [VarSet, ZDG_lastRoot, ""]
+  [VarSet, ZDG_savePath,
+    [FileNameAsk, "GoZ (*.goz)|*.goz||", "ZDowngrade.goz", "Choose EXPORT .goz save file"]]
+  [If, [StrLength, ZDG_savePath] > 0,
+    [If, [StrFind, ".goz", ZDG_savePath, 0] < 0,
+      [VarSet, ZDG_savePath, [StrMerge, ZDG_savePath, ".goz"]]
+    ]
+    [VarSet, ZDG_lastRoot, [FileNameExtract, ZDG_savePath, 1]]
+  ]
+]
+
+//==================================================================
+// Utility: zero-pad an integer to 2 digits.
+//==================================================================
+[RoutineDef, ZDG_Pad2,
+  [If, padInArg < 10,
+    [VarSet, ZDG_padOut, [StrMerge, "0", padInArg]]
+  ,
+    [VarSet, ZDG_padOut, [StrMerge, "", padInArg]]
+  ]
+, padInArg]
+
+//==================================================================
+// Utility: append one text chunk to ZDGTextOut.
+//==================================================================
+[RoutineDef, ZDG_TxtPut,
+  [MemResize, ZDGTextOut, [MemGetSize, ZDGTextOut] + 1024]
+  [VarSet, ZDGtxtBytes, [MemWriteString, ZDGTextOut, pStr, ZDGtxtOffset, 0]]
+  [VarSet, ZDGtxtOffset, ZDGtxtOffset + ZDGtxtBytes]
+, pStr]
+
+//==================================================================
+// Batch import: DLL ListGozFiles enumerates .goz into memblock.
+// ZScript reads each path; first file Tool:Import, following files
+// ZFileUtils AppendNewSubTool + select + Tool:Import (no modal
+// dialog/menu). No zimport_run.txt (that chain crashed ZBrush).
+//==================================================================
+[RoutineDef, ZDG_Import_Batch,
+  [VarSet, ZDG_importPath, ""]
+  [VarSet, ZDG_importPath,
+    [FileNameAsk, "GoZ (*.goz)|*.goz||", , "Select any .goz in the batch folder"]]
+
+  [If, [StrLength, ZDG_importPath] > 0,
+    [If, [FileExists, [Var, ZDG_metaDllFull]],
+      [VarSet, idir, [FileNameExtract, ZDG_importPath, 1]]
+
+      [If, [MemGetSize, ZDG_ListMem],
+        [MemDelete, ZDG_ListMem]
+      ]
+      [MemCreate, ZDG_ListMem, 65536, 0]
+      [VarSet, ZDG_metaPath, [StrMerge, idir, "zmeta.txt"]]
+      [If, [FileExists, [Var, ZDG_metaPath]],
+        [FileExecute, [Var, ZDG_metaDllFull], "ListGozByZmeta", [Var, ZDG_metaPath], 65536, ZDG_ListMem]
+      ,
+        [FileExecute, [Var, ZDG_metaDllFull], "ListGozFiles", idir, 65536, ZDG_ListMem]
+      ]
+
+      // FileExecute return values are unreliable on ZBrush 2023 - decide by
+      // memblock content (the count line) instead of the return value.
+      [VarSet, countStr, ""]
+      [VarSet, rd, 0]
+      [VarSet, rd, [MemReadString, ZDG_ListMem, countStr, 0, 1]]
+      [VarSet, offset, rd]
+      [VarSet, imp, 0]
+      [VarSet, impErr, 0]
+
+      [If, [StrLength, countStr] > 0,
+
+        [Loop, 65536,
+          [VarSet, fpath, ""]
+          [VarSet, rd, 0]
+          [VarSet, rd, [MemReadString, ZDG_ListMem, fpath, offset, 1]]
+          [VarSet, offset, offset + rd]
+          [If, rd == 0, [LoopExit]]
+          [If, [StrLength, fpath] == 0, [LoopExit]]
+
+          [If, [StrLength, fpath] > 0,
+            [If, [StrFind, "diag=", fpath, 0] == 0,
+              [LoopExit]
+            ]
+            [If, [FileExists, [Var, fpath]],
+              [If, imp == 0,
+                [FileNameSetNext, fpath]
+                [IPress, "Tool:Import"]
+              ,
+                [VarSet, cntBefore, [SubToolGetCount]]
+                [VarSet, baseName2, [FileNameExtract, fpath, 2]]
+                [VarSet, aeErr, [FileExecute, [Var, ZDG_dllFull], "AppendNewSubTool", baseName2]]
+                [VarSet, cntAfter, [SubToolGetCount]]
+                [If, cntAfter > cntBefore,
+                  [VarSet, newIdx, cntAfter]
+                  [VarSet, newIdx, newIdx - 1]
+                  [SubToolSelect, [Val, newIdx]]
+                  [FileNameSetNext, fpath]
+                  [IPress, "Tool:Import"]
+                ,
+                  [VarSet, impErr, 1]
+                  [LoopExit]
+                ]
+              ]
+              [VarInc, imp]
+            ,
+              [Note, [StrMerge, "ZDowngrade: file not found: ", fpath], , 5]
+              [VarSet, impErr, 1]
+              [LoopExit]
+            ]
+          ]
+        ]
+
+        [MemDelete, ZDG_ListMem]
+
+        [If, imp > 0,
+          [If, [FileExists, [Var, ZDG_metaPath]],
+            [RoutineCall, ZDG_RestoreSubdiv]
+            [RoutineCall, ZDG_RestoreFolders]
+          ]
+          [If, impErr == 1,
+            [Note, [StrMerge, "ZDowngrade import stopped early. Imported: ", imp, " .goz files. Folders: ", ZDG_foldersRestored, ". Subdiv: ", ZDG_subdivRestored], , 5]
+          ,
+            [Note, [StrMerge, "ZDowngrade import complete. Imported: ", imp, " .goz files. Folders: ", ZDG_foldersRestored, ". Subdiv: ", ZDG_subdivRestored], , 4]
+          ]
+        ,
+          [Note, "ZDowngrade: no .goz files found in the selected folder.", , 4]
+        ]
+      ,
+        [MemDelete, ZDG_ListMem]
+        [If, fcount < 0,
+          [VarSet, errTxt, ""]
+          [If, [MemGetSize, ZDG_ErrMem],
+            [MemDelete, ZDG_ErrMem]
+          ]
+          [MemCreate, ZDG_ErrMem, 4096, 0]
+          [FileExecute, [Var, ZDG_metaDllFull], "GetLastErrorText", , 4096, ZDG_ErrMem]
+          [MemReadString, ZDG_ErrMem, errTxt, 0, 0]
+          [MemDelete, ZDG_ErrMem]
+          [Note, [StrMerge, "ZDowngrade: ListGozFiles error ", fcount], , 5]
+          [If, [StrLength, errTxt] > 0,
+            [Note, errTxt, , 6]
+          ]
+        ,
+          [Note, "ZDowngrade: no .goz files found in the selected folder.", , 4]
+        ]
+      ]
+    ,
+      [Note, "ZDowngrade: ZDMetaIO64.dll not found.", , 4]
+    ]
+  ]
+]
+
+//==================================================================
+// Restore SubTool folders from zmeta.txt. Uses ZFileUtils RenameSetNext
+// to auto-name the folder dialog (official marcus_civis recipe) and
+// Tool:SubTool:MoveUp to move each member into the folder.
+//==================================================================
+[RoutineDef, ZDG_RestoreFolders,
+  [If, [MemGetSize, ZDG_PlanMem],
+    [MemDelete, ZDG_PlanMem]
+  ]
+  [MemCreate, ZDG_PlanMem, 65536, 0]
+  [FileExecute, [Var, ZDG_metaDllFull], "GetFolderPlan", [Var, ZDG_metaPath], 65536, ZDG_PlanMem]
+
+  [VarSet, nfStr, ""]
+  [VarSet, rd, 0]
+  [VarSet, rd, [MemReadString, ZDG_PlanMem, nfStr, 0, 1]]
+  [VarSet, off, rd]
+  [VarSet, nf, 0]
+  [VarSet, nf, nfStr]
+
+  [If, [StrLength, nfStr] > 0,
+    [Loop, nf,
+      [VarSet, fld, ""]
+      [VarSet, rd, 0]
+      [VarSet, rd, [MemReadString, ZDG_PlanMem, fld, off, 1]]
+      [VarSet, off, off + rd]
+      [VarSet, mcStr, ""]
+      [VarSet, rd, 0]
+      [VarSet, rd, [MemReadString, ZDG_PlanMem, mcStr, off, 1]]
+      [VarSet, off, off + rd]
+      [VarSet, mc, 0]
+      [VarSet, mc, mcStr]
+
+      [VarSet, fiStr, ""]
+      [VarSet, rd, 0]
+      [VarSet, rd, [MemReadString, ZDG_PlanMem, fiStr, off, 1]]
+      [VarSet, off, off + rd]
+      [VarSet, fi, 0]
+      [VarSet, fi, fiStr]
+
+      [SubToolSelect, [Val, fi]]
+      [If, ([IExists, "Tool:SubTool:New Folder"]) && ([IsEnabled, "Tool:SubTool:New Folder"]),
+        [FileExecute, [Var, ZDG_dllFull], "RenameSetNext", fld]
+        [IPress, "Tool:SubTool:New Folder"]
+      ]
+
+      [Loop, mc,
+        [If, [Val, i] > 0,
+          [VarSet, miStr, ""]
+          [VarSet, rd, 0]
+          [VarSet, rd, [MemReadString, ZDG_PlanMem, miStr, off, 1]]
+          [VarSet, off, off + rd]
+          [VarSet, mi, 0]
+          [VarSet, mi, miStr]
+          [SubToolSelect, [Val, mi]]
+          [Loop, 500,
+            [VarSet, cf, [SubToolGetFolderName]]
+            [If, ([StrFind, fld, cf, 0] == 0) && ([StrFind, cf, fld, 0] == 0),
+              [LoopExit]
+            ]
+            [If, [IExists, "Tool:SubTool:MoveUp"],
+              [IPress, "Tool:SubTool:MoveUp"]
+            ,
+              [LoopExit]
+            ]
+          ]
+        ]
+      , i]
+    , j]
+  ]
+  [VarSet, ZDG_foldersRestored, nf]
+  [MemDelete, ZDG_PlanMem]
+]
+
+//==================================================================
+// Restore subdivision levels on imported SubTools. Each press of
+// Tool:Geometry:Reconstruct Subdiv rebuilds one lower level. This only
+// works for meshes that are a Catmull-Clark subdivision of a lower mesh,
+// which is exactly what our exported max-SDiv .goz files are. The zmeta
+// sm (original sdivMax) is the rebuild target: stop once SDiv max reaches
+// sm, so we never over-reconstruct below the original subdivision stack
+// (a model subdivided from a 3-level base must not be rebuilt to level 1).
+// If sm is missing/0 (no zmeta record) the SubTool is skipped entirely -
+// no reconstruction without a known target. Loop cap of 5 is only a
+// safety valve - sm stops the loop first. At the end the SubTool is shown
+// at its highest level.
+//==================================================================
+[RoutineDef, ZDG_RestoreSubdiv,
+  [VarSet, cnt, [SubToolGetCount]]
+  [VarSet, rebuilt, 0]
+  [If, [MemGetSize, ZDG_SdivMem],
+    [MemDelete, ZDG_SdivMem]
+  ]
+  [MemCreate, ZDG_SdivMem, 65536, 0]
+  [FileExecute, [Var, ZDG_metaDllFull], "GetSubdivPlan", [Var, ZDG_metaPath], 65536, ZDG_SdivMem]
+  [VarSet, soff, 0]
+  [Loop, cnt,
+    [SubToolSelect, [Val, i]]
+    [If, [IExists, "Tool:Geometry:Reconstruct Subdiv"],
+      [If, [IExists, "Tool:Geometry:SDiv"],
+        [VarSet, smStr, ""]
+        [VarSet, rd, 0]
+        [VarSet, rd, [MemReadString, ZDG_SdivMem, smStr, soff, 1]]
+        [VarSet, soff, soff + rd]
+        [If, [StrLength, smStr] > 0,
+          [If, smStr > 0,
+            [VarSet, prevMax, [IGetMax, "Tool:Geometry:SDiv"]]
+            [Loop, 5,
+              [If, prevMax >= smStr, [LoopExit]]
+              [IPress, "Tool:Geometry:Reconstruct Subdiv"]
+              [VarSet, newMax, [IGetMax, "Tool:Geometry:SDiv"]]
+              [If, newMax <= prevMax, [LoopExit]]
+              [VarSet, prevMax, newMax]
+            ]
+            [ISet, "Tool:Geometry:SDiv", [IGetMax, "Tool:Geometry:SDiv"]]
+            [VarInc, rebuilt]
+          ]
+        ]
+      ]
+    ]
+  , i]
+  [MemDelete, ZDG_SdivMem]
+  [VarSet, ZDG_subdivRestored, rebuilt]
+]
+
+//==================================================================
+// Export entry: pick save file only after SubToolGetCount confirms work.
+//==================================================================
+[RoutineDef, ZDG_Export_All,
+  [VarSet, count, [SubToolGetCount]]
+  [If, count < 1,
+    [Note, "No exportable SubTools. Load/select a Polymesh Tool first.", , 3]
+  ,
+    [RoutineCall, ZDG_PickSaveFile]
+    [If, [StrLength, ZDG_savePath] == 0,
+      [Note, "Cancelled. No save file selected.", , 2]
+    ,
+      [RoutineCall, ZDG_Export_Run, count]
+    ]
+  ]
+]
+
+//==================================================================
+// Real Export routine
+//==================================================================
+[RoutineDef, ZDG_Export_Run,
+  [VarSet, count, countArg]
+  [VarSet, origIdx, [SubToolGetActiveIndex]]
+  [VarSet, exportedCount, 0]
+  [VarSet, ZDG_folderPos, 0]
+
+  [VarSet, ZDGtxtPath, [StrMerge, ZDG_lastRoot, "zmeta.txt"]]
+  [If, [MemGetSize, ZDGTextOut],
+    [MemDelete, ZDGTextOut]
+  ]
+  [MemCreate, ZDGTextOut, 1024, 0]
+  [VarSet, ZDGtxtOffset, 0]
+  [RoutineCall, ZDG_TxtPut, [StrMerge, "schema=2;version=", ZDG_version, ";count=", count, ";fields=o,n,f,fi,fn,fp,sc,sm,st", ZDGcrlf]]
+
+  [Loop, count,
+    [SubToolSelect, [Val, i]]
+
+    [VarSet, activeIdx, [SubToolGetActiveIndex]]
+    [If, activeIdx == i,
+      [VarSet, baseName, [IGetTitle, "Tool:Item Info"]]
+      [VarSet, dotPos, [StrFind, ". ", baseName, 0]]
+      [If, dotPos > 0,
+        [VarSet, baseName, [StrExtract, baseName, 0, dotPos - 1]]
+      ]
+      [If, [StrLength, baseName] > 1,
+        [VarSet, lastChar, [StrExtract, baseName, [StrLength, baseName] - 1, [StrLength, baseName] - 1]]
+        [If, [StrFind, ".", lastChar, 0] == 0,
+          [VarSet, baseName, [StrExtract, baseName, 0, [StrLength, baseName] - 2]]
+        ]
+      ]
+      [If, [StrLength, baseName] == 0,
+        [VarSet, baseName, [StrMerge, "SubTool_", i]]
+      ]
+
+      [VarSet, ZDG_folderIndex, [SubToolGetFolderIndex, [Val, i]]]
+      [VarSet, ZDG_folderName, [SubToolGetFolderName, [Val, i]]]
+      [VarSet, ZDG_folderPos, i]
+
+      [VarSet, sdivCur, 0]
+      [VarSet, sdivMax, 0]
+      [If, [IExists, "Tool:Geometry:SDiv"] > 0,
+        [VarSet, sdivCur, [IGet,    "Tool:Geometry:SDiv"]]
+        [VarSet, sdivMax, [IGetMax, "Tool:Geometry:SDiv"]]
+      ]
+
+      [VarSet, statusBits, [SubToolGetStatus, [Val, i]]]
+
+      [If, sdivMax > 1,
+        [ISet, "Tool:Geometry:SDiv", sdivMax]
+      ]
+
+      [If, count == 1,
+        [VarSet, gozPath, ZDG_savePath]
+        [VarSet, finalFile, [FileNameExtract, ZDG_savePath, 2]]
+      ,
+        [VarSet, finalName, baseName]
+        [VarSet, suffix, 0]
+        [Loop, 999,
+          [VarSet, gozPath, [StrMerge, ZDG_lastRoot, finalName, ".goz"]]
+          [If, [FileExists, gozPath] == 0,
+            [LoopExit]
+          ]
+          [VarInc, suffix]
+          [RoutineCall, ZDG_Pad2, suffix]
+          [VarSet, finalName, [StrMerge, baseName, "_", ZDG_padOut]]
+        ]
+        [VarSet, finalFile, [StrMerge, finalName, ".goz"]]
+      ]
+      [FileNameSetNext, gozPath]
+      [IPress, "Tool:Export"]
+
+      [If, sdivMax > 1,
+        [ISet, "Tool:Geometry:SDiv", sdivCur]
+      ]
+
+      [RoutineCall, ZDG_TxtPut, "S|"]
+      [RoutineCall, ZDG_TxtPut, i]
+      [RoutineCall, ZDG_TxtPut, "|"]
+      [RoutineCall, ZDG_TxtPut, finalFile]
+      [RoutineCall, ZDG_TxtPut, "|"]
+      [RoutineCall, ZDG_TxtPut, baseName]
+      [RoutineCall, ZDG_TxtPut, "|"]
+      [RoutineCall, ZDG_TxtPut, ZDG_folderIndex]
+      [RoutineCall, ZDG_TxtPut, "|"]
+      [RoutineCall, ZDG_TxtPut, ZDG_folderName]
+      [RoutineCall, ZDG_TxtPut, "|"]
+      [RoutineCall, ZDG_TxtPut, ZDG_folderPos]
+      [RoutineCall, ZDG_TxtPut, "|"]
+      [RoutineCall, ZDG_TxtPut, sdivCur]
+      [RoutineCall, ZDG_TxtPut, "|"]
+      [RoutineCall, ZDG_TxtPut, sdivMax]
+      [RoutineCall, ZDG_TxtPut, "|"]
+      [RoutineCall, ZDG_TxtPut, statusBits]
+      [RoutineCall, ZDG_TxtPut, ZDGcrlf]
+
+      [VarInc, exportedCount]
+    ,
+      [Note, [StrMerge, "Skipped SubTool index ", i, ": selection failed."], , 2]
+    ]
+  , i]
+
+  [SubToolSelect, [Val, origIdx]]
+
+  [MemResize, ZDGTextOut, ZDGtxtOffset]
+  // zmeta.txt is written by the DLL (SaveMetaFile), not by MemSaveToFile:
+  // ZBrush's MemSaveToFile forces ".txt" to ".TXT" uppercase, which breaks
+  // consumers on case-sensitive filesystems. Verify the result with
+  // FileExists - FileExecute return values are unreliable on ZBrush 2023.
+  [FileExecute, [Var, ZDG_metaDllFull], "SaveMetaFile", [Var, ZDGtxtPath], [MemGetSize, ZDGTextOut], ZDGTextOut]
+  [VarSet, ZDGsaveBytes, [FileExists, [Var, ZDGtxtPath]]]
+  [MemDelete, ZDGTextOut]
+
+  [If, ZDGsaveBytes == 0,
+    [Note,
+      [StrMerge,
+        "ZDowngrade export complete. Exported: ", exportedCount, " of ", count, " SubTools. Root: ", ZDG_lastRoot, ". WARNING: zmeta.txt write failed (check folder permissions)."
+      ], , 5]
+  ,
+    [Note,
+      [StrMerge,
+        "ZDowngrade export complete. Exported: ", exportedCount, " of ", count, " SubTools. Root: ", ZDG_lastRoot
+      ], , 4]
+  ]
+, countArg]
+
+//==================================================================
+// About: version + author + brief usage
+//==================================================================
+[RoutineDef, ZDG_About,
+  [Note,
+    [StrMerge,
+      "ZDowngrade v", ZDG_version,
+      " | Author: grandakun",
+      " | Exports every SubTool to .goz + readable zmeta.txt manifest",
+      " | Imports a folder of .goz back into SubTools, restoring order, folders and subdivision levels",
+      " | GoZ is cross-version safe (ZBrush 4R6+)"], , 4]
+]
+
+//==================================================================
+// UI
+//==================================================================
+[ISubPalette, "ZPlugin:ZDowngrade"]
+
+[IButton, "ZPlugin:ZDowngrade:Export",
+  "Export every SubTool to a .goz file plus a readable zmeta.txt manifest.",
+  [RoutineCall, ZDG_Export_All]
+, , 1]
+
+[IButton, "ZPlugin:ZDowngrade:Import",
+  "Batch import all .goz files from a folder back into SubTools.",
+  [RoutineCall, ZDG_Import_Batch]
+, , 1]
+
+[IButton, "ZPlugin:ZDowngrade:About",
+  "Show plugin info: version, author, and usage.",
+  [RoutineCall, ZDG_About]
+, , 1]
+
+//------------------------------------------------------------------
+// End of ZDowngrade.txt (1.0.0)
+//------------------------------------------------------------------

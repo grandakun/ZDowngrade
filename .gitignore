@@ -1,0 +1,17 @@
+*.obj
+*.bak
+*.tmp
+*.log
+*.pdb
+*.ilk
+*.exp
+*.goz
+*.ztl
+*.zsc
+zmeta.txt
+.vs/
+.buildtools/
+
+# 开发文档(技能/设计),发布仓库不需要
+Skill/
+Design/

@@ -1,0 +1,2 @@
+*.goz filter=lfs diff=lfs merge=lfs -text
+*.ztl filter=lfs diff=lfs merge=lfs -text
